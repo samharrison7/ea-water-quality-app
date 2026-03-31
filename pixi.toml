@@ -1,0 +1,16 @@
+[project]
+authors = ["Sam Harrison <samharrison.xg@gmail.com>"]
+channels = ["conda-forge"]
+description = "EA Water Quality Archive app"
+name = "ea-water-quality-app"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+polars = ">=1.38.1,<2"
+streamlit = ">=1.55.0,<2"
+fsspec = ">=2026.3.0,<2027"
+s3fs = ">=2026.3.0,<2027"
+aiobotocore = ">=3.3.0,<4"
