@@ -1,0 +1,11 @@
+name: default
+channels:
+- conda-forge
+- nodefaults
+dependencies:
+- polars >=1.38.1,<2
+- streamlit >=1.55.0,<2
+- fsspec >=2026.3.0,<2027
+- s3fs >=2026.3.0,<2027
+- aiobotocore >=3.3.0,<4
+
