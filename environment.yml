@@ -8,4 +8,6 @@ dependencies:
 - fsspec >=2026.3.0,<2027
 - s3fs >=2026.3.0,<2027
 - aiobotocore >=3.3.0,<4
+- scipy >=1.13,<2
+- plotly >=5.20,<7
 
