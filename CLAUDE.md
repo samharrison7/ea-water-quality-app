@@ -13,6 +13,10 @@ Streamlit app for inspecting Environment Agency Water Quality Archive data. Pers
 
 There are no tests or lint configurations in this repo.
 
+## Code Conventions
+
+- Stick strictly to PEP8, including 79 character line length maximum.
+
 ## Architecture
 
 - **Entry point** — `src/app.py` wires up Streamlit multi-page navigation via `st.navigation` over files in `src/pages/`. Adding a page means adding both the file under `src/pages/` and a `st.Page(...)` entry in `app.py`.

@@ -70,71 +70,141 @@ def ros_impute(values: np.ndarray, is_censored: np.ndarray) -> np.ndarray | None
 
 @st.cache_data
 def get_determinands():
+    csv_path = (
+        's3://ea-water-quality/'
+        'EA_WQA_determinands_by-sampleMaterialType.csv'
+    )
     df_determinands = pl.read_csv(
-        's3://ea-water-quality/EA_WQA_determinands_by-sampleMaterialType.csv',
+        csv_path,
         storage_options=storage_options
     )
     # Get the determinands (by notation and prefLabel)
     df_ = (
         df_determinands
-        .select(['determinand.notation', 'determinand.prefLabel', 'unit'])
+        .select([
+            'determinand.notation',
+            'determinand.prefLabel',
+            'unit'
+        ])
         .unique()
         .drop_nulls('determinand.prefLabel')
         .sort('determinand.prefLabel')
     )
-    determinand_lookup = {f'{row["determinand.prefLabel"]} ({row["determinand.notation"]})': row['determinand.notation']
-                          for row in df_.iter_rows(named=True)}
-    # For each determinand, which sample material types actually have measurements.
-    # Used to restrict the sample-material dropdown to relevant options.
+    determinand_lookup = {
+        f'{row["determinand.prefLabel"]} '
+        f'({row["determinand.notation"]})':
+        row['determinand.notation']
+        for row in df_.iter_rows(named=True)
+    }
+    # For each determinand, which sample material types
+    # actually have measurements.
     sample_materials_by_determinand = {
         row['determinand.notation']: row['materials']
         for row in df_determinands
         .group_by('determinand.notation')
-        .agg(pl.col('sampleMaterialType').unique().alias('materials'))
+        .agg(
+            pl.col('sampleMaterialType')
+            .unique()
+            .alias('materials')
+        )
         .iter_rows(named=True)
     }
-    return determinand_lookup, sample_materials_by_determinand
+    # For each sample material type, which determinands
+    # have measurements.
+    determinands_by_sample_material = {
+        row['sampleMaterialType']: row['notations']
+        for row in df_determinands
+        .group_by('sampleMaterialType')
+        .agg(
+            pl.col('determinand.notation')
+            .unique()
+            .alias('notations')
+        )
+        .iter_rows(named=True)
+    }
+    return (
+        determinand_lookup,
+        sample_materials_by_determinand,
+        determinands_by_sample_material,
+    )
 
 
-determinand_lookup, sample_materials_by_determinand = get_determinands()
-determinands = st.multiselect('Select determinands',
-                              options=list(determinand_lookup.keys()))
-determinand_notations = [determinand_lookup[d] for d in determinands]
-sample_material_types = sorted({
-    sm
-    for n in determinand_notations
-    for sm in sample_materials_by_determinand.get(n, [])
-})
+(determinand_lookup,
+ sample_materials_by_determinand,
+ determinands_by_sample_material) = get_determinands()
+
+all_sample_materials = sorted(
+    determinands_by_sample_material.keys()
+)
+sample_material = st.multiselect(
+    'Select sample material type',
+    options=all_sample_materials)
+
+# Compute which determinands have measurements in
+# selected sample materials
+if sample_material:
+    available_determinands_set = set()
+    for sm in sample_material:
+        available_determinands_set.update(
+            determinands_by_sample_material.get(sm, [])
+        )
+else:
+    available_determinands_set = set()
+
+filtered_determinand_lookup = {
+    k: v for k, v in determinand_lookup.items()
+    if v in available_determinands_set
+}
+
+determinands = st.multiselect(
+    'Select determinands',
+    options=list(filtered_determinand_lookup.keys()),
+)
+determinand_notations = [
+    filtered_determinand_lookup[d] for d in determinands
+]
 
 st.write('## Detects vs determinations')
 st.write("""For the selected determinands, this shows the total number
 of measurements (determinations) compared to the number of measurements
 where the determinand(s) was detected (i.e. the value was above the limit
-of detection). You can use the following filter to only filter to specific
-sample material types.""")
+of detection).""")
 
 # Create a dataframe for the given determinands
 if len(determinand_notations) > 0:
     dfs = []
     for notation in determinand_notations:
-        df_ = pl.scan_parquet(f's3://ea-water-quality/determinand_{notation}.parquet',
-                              storage_options=dict(st.secrets['storage']))
+        parquet_path = (
+            f's3://ea-water-quality/'
+            f'determinand_{notation}.parquet'
+        )
+        df_ = pl.scan_parquet(
+            parquet_path,
+            storage_options=dict(st.secrets['storage'])
+        )
         dfs.append(df_)
 
     df = pl.concat(dfs)
-    sample_material = st.multiselect('Filter by sample material type',
-                                     options=sample_material_types)
 
-    # Filter to the selected sample material types and parse `result` into
-    # a censored flag + numeric value. Rows that fail to parse are dropped.
+    # Filter to the selected sample material types and parse `result`
+    # into a censored flag + numeric value. Rows that fail to parse
+    # are dropped
     canonical_map = {k: v[0] for k, v in UNIT_CONVERSIONS.items()}
     factor_map = {k: v[1] for k, v in UNIT_CONVERSIONS.items()}
     df = (
-        df.filter(pl.col('sampleMaterialType').is_in(sample_material))
+        df.filter(
+            pl.col('sampleMaterialType').is_in(
+                sample_material
+            )
+        )
         .collect()
         .with_columns(
             is_censored=pl.col('result').str.starts_with('<'),
-            result_value=pl.col('result').str.strip_prefix('<').cast(pl.Float64, strict=False),
+            result_value=(
+                pl.col('result')
+                .str.strip_prefix('<')
+                .cast(pl.Float64, strict=False)
+            ),
             unit_canonical=pl.col('unit').replace(canonical_map),
             unit_factor=pl.col('unit').replace_strict(
                 list(factor_map.keys()),
@@ -149,16 +219,28 @@ if len(determinand_notations) > 0:
     total_determinations = len(df)
     df_detects = df.filter(~pl.col('is_censored'))
     total_detects = len(df_detects)
-    n_sampling_points = df_detects['samplingPoint.prefLabel'].n_unique()
-    proportion_detects = float(total_detects) / float(total_determinations) \
+    n_sampling_points = (
+        df_detects['samplingPoint.prefLabel'].n_unique()
+    )
+    proportion_detects = (
+        float(total_detects) / float(total_determinations)
         if total_determinations > 0 else 0
+    )
 
     # Display the stats
     c1, c2 = st.columns(2)
-    c1.metric('Number of measurements', f'{total_determinations:,}', border=True)
-    c1.metric('Number of detects', f'{total_detects:,}', border=True)
-    c2.metric('Detection proportion', f'{proportion_detects:.1%}', border=True)
-    c2.metric('Number of sampling points', f'{n_sampling_points:,}', border=True)
+    c1.metric('Number of measurements',
+              f'{total_determinations:,}',
+              border=True)
+    c1.metric('Number of detects',
+              f'{total_detects:,}',
+              border=True)
+    c2.metric('Detection proportion',
+              f'{proportion_detects:.1%}',
+              border=True)
+    c2.metric('Number of sampling points',
+              f'{n_sampling_points:,}',
+              border=True)
 
     st.write('## Distribution')
     st.write("""Distribution of the measurement values for the selected
@@ -171,36 +253,49 @@ if len(determinand_notations) > 0:
         canonicals = df['unit_canonical'].unique().to_list()
         if len(canonicals) > 1:
             group_lines = [
-                f'**{r["unit_canonical"]}**: {", ".join(r["units"])}'
+                f'**{r["unit_canonical"]}**: '
+                f'{", ".join(r["units"])}'
                 for r in df.group_by('unit_canonical')
                 .agg(pl.col('unit').unique().alias('units'))
                 .sort('unit_canonical')
                 .to_dicts()
             ]
             st.error(
-                'Cannot plot distribution — selected determinands use incompatible '
-                'units (no simple conversion between these families):\n\n'
+                'Cannot plot distribution — selected '
+                'determinands use incompatible '
+                'units (no simple conversion between '
+                'these families):\n\n'
                 + '\n\n'.join(group_lines)
             )
         else:
-            # Pick the most common original unit as the display unit and convert
-            # every row's value into it. For single-unit selections this is a
-            # no-op (factor cancels out).
-            unit_counts = df.group_by('unit').len().sort('len', descending=True)
+            # Pick the most common original unit as  the display unit and
+            # convert every row's value into it. For single-unit selections
+            # this is a no-op (factor cancels out).
+            unit_counts = (df.group_by('unit').len().sort('len',
+                                                          descending=True))
             display_unit = unit_counts['unit'][0]
-            display_factor = UNIT_CONVERSIONS.get(display_unit, (display_unit, 1.0))[1]
-            display_label = UNIT_CONVERSIONS.get(display_unit, (None, None, display_unit))[2]
+            display_factor = UNIT_CONVERSIONS.get(display_unit,
+                                                  (display_unit, 1.0))[1]
+            display_label = UNIT_CONVERSIONS.get(display_unit,
+                                                 (None, None, display_unit))[2]
 
             df = df.with_columns(
-                result_value=pl.col('result_value') * pl.col('unit_factor') / display_factor
+                result_value=(pl.col('result_value') * pl.col('unit_factor')
+                              / display_factor)
             )
 
-            converted = unit_counts.filter(pl.col('unit') != display_unit)
+            converted = unit_counts.filter(
+                pl.col('unit') != display_unit
+            )
             if converted.height > 0:
                 msg = ', '.join(
-                    f'{r["unit"]} ({r["len"]:,} rows)' for r in converted.to_dicts()
+                    f'{r["unit"]} ({r["len"]:,} rows)'
+                    for r in converted.to_dicts()
                 )
-                st.caption(f'Converted to {display_label}: {msg}.')
+                st.caption(
+                    f'Converted to {display_label}: '
+                    f'{msg}.'
+                )
 
             strategy = st.radio(
                 'Non-detect handling',
@@ -228,13 +323,25 @@ if len(determinand_notations) > 0:
                     values = imputed
 
             if len(values) == 0:
-                st.info('No measurements available after applying the chosen strategy.')
+                st.info(
+                    'No measurements available after '
+                    'applying the chosen strategy.'
+                )
             else:
                 if log_axis and np.any(values <= 0):
-                    st.warning('Log-scale x-axis disabled: data contains values ≤ 0.')
+                    st.warning(
+                        'Log-scale x-axis disabled: data '
+                        'contains values ≤ 0.'
+                    )
                     log_axis = False
 
-                geomean = float(np.exp(np.mean(np.log(values)))) if np.all(values > 0) else None
+                geomean = (
+                    float(
+                        np.exp(np.mean(np.log(values)))
+                    )
+                    if np.all(values > 0)
+                    else None
+                )
                 category = '<br>'.join([
                     ', '.join(determinands),
                     ', '.join(sample_material),
@@ -253,7 +360,10 @@ if len(determinand_notations) > 0:
                     points='outliers',
                     log_x=log_axis,
                 )
-                fig.update_traces(showlegend=False, selector=dict(type='box'))
+                fig.update_traces(
+                    showlegend=False,
+                    selector=dict(type='box')
+                )
                 fig.update_layout(
                     xaxis_title=f'Value ({display_label})',
                     yaxis_title=None,
@@ -268,16 +378,37 @@ if len(determinand_notations) > 0:
                         x=[geomean],
                         y=[category],
                         mode='markers',
-                        marker=dict(symbol='diamond', color='red', size=12,
-                                    line=dict(color='black', width=0.5)),
+                        marker=dict(
+                            symbol='diamond',
+                            color='red',
+                            size=12,
+                            line=dict(
+                                color='black',
+                                width=0.5,
+                            ),
+                        ),
                         name='Geomean',
-                        hovertemplate=f'Geomean: %{{x:.4g}} {display_label}<extra></extra>',
+                        hovertemplate=(
+                            f'Geomean: %{{x:.4g}} '
+                            f'{display_label}<extra></extra>'
+                        ),
                     ))
 
-                st.caption(f'n = {len(values):,}' + (
-                    f' · geomean (red diamond) = {geomean:.4g} {display_label}'
-                    if geomean is not None else ' · geomean: n/a (data contains values ≤ 0)'
-                ))
-                st.plotly_chart(fig, use_container_width=True)
+                if geomean is not None:
+                    caption = (
+                        f'n = {len(values):,}'
+                        f' · geomean (red diamond) = '
+                        f'{geomean:.4g} {display_label}'
+                    )
+                else:
+                    caption = (
+                        f'n = {len(values):,}'
+                        ' · geomean: n/a (data contains '
+                        'values ≤ 0)'
+                    )
+                st.caption(caption)
+                st.plotly_chart(
+                    fig, use_container_width=True
+                )
 else:
     st.warning('Please select at least one determinand to see the data.')
