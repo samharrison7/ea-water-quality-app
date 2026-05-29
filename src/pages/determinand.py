@@ -68,24 +68,52 @@ def ros_impute(values: np.ndarray, is_censored: np.ndarray) -> np.ndarray | None
     return imputed
 
 
+# Facets the user can filter determinands by. Each entry maps the UI label
+# to (parquet column name, lookup CSV path).
+FACETS = {
+    'Sample material type': (
+        'sampleMaterialType',
+        's3://ea-water-quality/'
+        'EA_WQA_determinands_by-sampleMaterialType.csv',
+    ),
+    'Sampling point type': (
+        'samplingPoint.samplingPointType',
+        's3://ea-water-quality/'
+        'EA_WQA_determinands_by-samplingPointType.csv',
+    ),
+}
+
+
 @st.cache_data
 def get_determinands():
-    csv_path = (
-        's3://ea-water-quality/'
-        'EA_WQA_determinands_by-sampleMaterialType.csv'
-    )
-    df_determinands = pl.read_csv(
-        csv_path,
-        storage_options=storage_options
-    )
-    # Get the determinands (by notation and prefLabel)
-    df_ = (
-        df_determinands
-        .select([
-            'determinand.notation',
-            'determinand.prefLabel',
-            'unit'
-        ])
+    determinand_frames = []
+    determinands_by_facet = {}
+    for label, (col, csv_path) in FACETS.items():
+        df_ = pl.read_csv(
+            csv_path,
+            storage_options=storage_options,
+        )
+        determinand_frames.append(
+            df_.select([
+                'determinand.notation',
+                'determinand.prefLabel',
+                'unit',
+            ])
+        )
+        determinands_by_facet[col] = {
+            row[col]: row['notations']
+            for row in df_
+            .group_by(col)
+            .agg(
+                pl.col('determinand.notation')
+                .unique()
+                .alias('notations')
+            )
+            .iter_rows(named=True)
+        }
+
+    df_all = (
+        pl.concat(determinand_frames)
         .unique()
         .drop_nulls('determinand.prefLabel')
         .sort('determinand.prefLabel')
@@ -94,59 +122,34 @@ def get_determinands():
         f'{row["determinand.prefLabel"]} '
         f'({row["determinand.notation"]})':
         row['determinand.notation']
-        for row in df_.iter_rows(named=True)
+        for row in df_all.iter_rows(named=True)
     }
-    # For each determinand, which sample material types
-    # actually have measurements.
-    sample_materials_by_determinand = {
-        row['determinand.notation']: row['materials']
-        for row in df_determinands
-        .group_by('determinand.notation')
-        .agg(
-            pl.col('sampleMaterialType')
-            .unique()
-            .alias('materials')
-        )
-        .iter_rows(named=True)
-    }
-    # For each sample material type, which determinands
-    # have measurements.
-    determinands_by_sample_material = {
-        row['sampleMaterialType']: row['notations']
-        for row in df_determinands
-        .group_by('sampleMaterialType')
-        .agg(
-            pl.col('determinand.notation')
-            .unique()
-            .alias('notations')
-        )
-        .iter_rows(named=True)
-    }
-    return (
-        determinand_lookup,
-        sample_materials_by_determinand,
-        determinands_by_sample_material,
-    )
+    return determinand_lookup, determinands_by_facet
 
 
-(determinand_lookup,
- sample_materials_by_determinand,
- determinands_by_sample_material) = get_determinands()
+determinand_lookup, determinands_by_facet = get_determinands()
 
-all_sample_materials = sorted(
-    determinands_by_sample_material.keys()
+facet_label = st.radio(
+    'Filter determinands by',
+    list(FACETS.keys()),
+    horizontal=True,
 )
-sample_material = st.multiselect(
-    'Select sample material type',
-    options=all_sample_materials)
+facet_col = FACETS[facet_label][0]
+determinands_by_value = determinands_by_facet[facet_col]
 
-# Compute which determinands have measurements in
-# selected sample materials
-if sample_material:
+all_facet_values = sorted(determinands_by_value.keys())
+facet_selection = st.multiselect(
+    f'Select {facet_label.lower()}',
+    options=all_facet_values,
+)
+
+# Compute which determinands have measurements for the
+# selected facet values.
+if facet_selection:
     available_determinands_set = set()
-    for sm in sample_material:
+    for v in facet_selection:
         available_determinands_set.update(
-            determinands_by_sample_material.get(sm, [])
+            determinands_by_value.get(v, [])
         )
 else:
     available_determinands_set = set()
@@ -193,9 +196,7 @@ if len(determinand_notations) > 0:
     factor_map = {k: v[1] for k, v in UNIT_CONVERSIONS.items()}
     df = (
         df.filter(
-            pl.col('sampleMaterialType').is_in(
-                sample_material
-            )
+            pl.col(facet_col).is_in(facet_selection)
         )
         .collect()
         .with_columns(
@@ -344,7 +345,7 @@ if len(determinand_notations) > 0:
                 )
                 category = '<br>'.join([
                     ', '.join(determinands),
-                    ', '.join(sample_material),
+                    ', '.join(facet_selection),
                 ])
 
                 pdf = pl.DataFrame({
